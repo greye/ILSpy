@@ -44,7 +44,7 @@ namespace ICSharpCode.Decompiler.ILAst
 	class StateRange
 	{
 		readonly List<Interval> data = new List<Interval>();
-		
+
 		public StateRange()
 		{
 		}
@@ -54,6 +54,10 @@ namespace ICSharpCode.Decompiler.ILAst
 			this.data.Add(new Interval(start, end));
 		}
 		
+		public int Lower {
+			get { return data[0].Start; }
+		}
+
 		public bool IsEmpty {
 			get { return data.Count == 0; }
 		}
@@ -247,6 +251,11 @@ namespace ICSharpCode.Decompiler.ILAst
 								goto default;
 							}
 						}
+					case ILCode.Stfld:
+						if (mode == StateRangeAnalysisMode.IteratorMoveNext) {
+							return i;
+						}
+						break;
 					case ILCode.Call:
 						// in some cases (e.g. foreach over array) the C# compiler produces a finally method outside of try-finally blocks
 						if (mode == StateRangeAnalysisMode.IteratorDispose) {

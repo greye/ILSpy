@@ -161,13 +161,15 @@ namespace ICSharpCode.Decompiler.ILAst
 		{
 			// newobj(CurrentType/...::.ctor, ldc.i4(-2))
 			ctor = null;
-			if (expr.Code != ILCode.Newobj || expr.Arguments.Count != 1)
+			if (expr.Code != ILCode.Newobj)
 				return false;
-			if (expr.Arguments[0].Code != ILCode.Ldc_I4)
+			if (expr.Arguments.Count == 1 && expr.Arguments[0].Code == ILCode.Ldc_I4) {
+				int initialState = (int)expr.Arguments[0].Operand;
+				if (!(initialState == -2 || initialState == 0))
+					return false;
+			} else if (expr.Arguments.Count != 0) // accept default ctors
 				return false;
-			int initialState = (int)expr.Arguments[0].Operand;
-			if (!(initialState == -2 || initialState == 0))
-				return false;
+
 			ctor = GetMethodDefinition(expr.Operand as MethodReference);
 			if (ctor == null || ctor.DeclaringType.DeclaringType != context.CurrentType)
 				return false;
@@ -192,6 +194,26 @@ namespace ICSharpCode.Decompiler.ILAst
 		/// </summary>
 		void AnalyzeCtor()
 		{
+			MethodDefinition moveNextMethod = enumeratorType.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+			ILBlock ilMethod = CreateILAst(moveNextMethod);
+			int i = 0;
+			foreach (ILNode node in ilMethod.Body) {
+				ILExpression expr = node as ILExpression;
+				if (node.Match(ILCode.Switch) || node.Match(ILCode.Brtrue)) {
+					ILExpression switchOn = expr.Arguments.Last();
+					ILVariable localVar;
+
+					if (switchOn.Match(ILCode.Ldloc, out localVar)) {
+						ILExpression e = FindAssignedValue(switchOn, ilMethod.Body.GetRange(0, i));
+						ILExpression instance;
+						FieldReference field;
+						if (e.Match(ILCode.Ldfld, out field, out instance) && instance.MatchThis())
+							stateField = GetFieldDefinition(field);
+					}
+					break;
+				}
+				++i;
+			}
 			ILBlock method = CreateILAst(enumeratorCtor);
 			
 			foreach (ILNode node in method.Body) {
@@ -211,6 +233,34 @@ namespace ICSharpCode.Decompiler.ILAst
 				throw new SymbolicAnalysisFailedException();
 		}
 		
+		ILExpression FindAssignedValue(ILExpression expr, List<ILNode> stmts) {
+			ILVariable tmp;
+			int count = stmts.Count;
+			while (count > 0 && expr.Match(ILCode.Ldloc, out tmp)) {
+				int index;
+				ILExpression value = FindAssignment(tmp, stmts.GetRange(0, count), out index);
+				if (index >= 0) {
+					expr = value;
+				}
+				count = index;
+			}
+			return expr;
+		}
+
+		ILExpression FindAssignment(ILVariable var, List<ILNode> stmts, out int pos) {
+			int i = 0;
+			foreach (ILNode node in stmts) {
+				ILVariable assignTo;
+				ILExpression value;
+				if (node.Match(ILCode.Stloc, out assignTo, out value) && assignTo == var) {
+					pos = i;
+					return value;
+				}
+			}
+			pos = -1;
+			return null;
+		}
+
 		/// <summary>
 		/// Creates ILAst for the specified method, optimized up to before the 'YieldReturn' step.
 		/// </summary>
@@ -316,7 +366,10 @@ namespace ICSharpCode.Decompiler.ILAst
 		
 		void ConstructExceptionTable()
 		{
-			disposeMethod = enumeratorType.Methods.FirstOrDefault(m => m.Name == "System.IDisposable.Dispose");
+			var methods = enumeratorType.Methods;
+			disposeMethod = methods.FirstOrDefault(m => m.Name == "System.IDisposable.Dispose") ??
+				methods.FirstOrDefault(m => m.Name == "Dispose");
+
 			ILBlock ilMethod = CreateILAst(disposeMethod);
 			
 			var rangeAnalysis = new StateRangeAnalysis(ilMethod.Body[0], StateRangeAnalysisMode.IteratorDispose, stateField);
@@ -359,27 +412,50 @@ namespace ICSharpCode.Decompiler.ILAst
 			if (ilMethod.Body.Count == 0)
 				throw new SymbolicAnalysisFailedException();
 			ILExpression lastReturnArg;
-			if (!ilMethod.Body.Last().Match(ILCode.Ret, out lastReturnArg))
+			ILNode lastRet = null;
+			int labelIndex = -1;
+			foreach (ILNode node in ilMethod.Body) {
+				List<ILExpression> args = null;
+				if (node.Match(ILCode.Br, out returnLabel) || node.Match(ILCode.Brtrue, out returnLabel, out args)) {
+					labelIndex = ilMethod.Body.FindIndex(x => x == returnLabel);
+					lastRet = ilMethod.Body[labelIndex + 1];
+					break;
+				}
+			}
+			if (labelIndex < 0 || lastRet == null || !lastRet.Match(ILCode.Ret, out lastReturnArg)) {
 				throw new SymbolicAnalysisFailedException();
-			
+			}
+
 			// There are two possibilities:
 			if (lastReturnArg.Code == ILCode.Ldloc) {
 				// a) the compiler uses a variable for returns (in debug builds, or when there are try-finally blocks)
 				returnVariable = (ILVariable)lastReturnArg.Operand;
-				returnLabel = ilMethod.Body.ElementAtOrDefault(ilMethod.Body.Count - 2) as ILLabel;
 				if (returnLabel == null)
 					throw new SymbolicAnalysisFailedException();
 			} else {
 				// b) the compiler directly returns constants
 				returnVariable = null;
-				returnLabel = null;
 				// In this case, the last return must return false.
 				if (lastReturnArg.Code != ILCode.Ldc_I4 || (int)lastReturnArg.Operand != 0)
 					throw new SymbolicAnalysisFailedException();
 			}
 			
 			ILTryCatchBlock tryFaultBlock = ilMethod.Body[0] as ILTryCatchBlock;
-			List<ILNode> body;
+			List<ILNode> body = ilMethod.Body;
+			if (ilMethod.Body.Last() != lastRet) {
+				body = new List<ILNode>(ilMethod.Body);
+				body.AddRange(ilMethod.Body.GetRange(labelIndex, 2));
+				body.RemoveRange(labelIndex, 2);
+				body.Insert(labelIndex, new ILExpression(ILCode.Br, returnLabel));
+			}
+			for (int i = body.FindIndex(x => x.Match(ILCode.Br)) - 1; i >= 0; --i) {
+				FieldReference field;
+				ILExpression instance, value;
+				if (body[i].Match(ILCode.Stfld, out field, out instance, out value) &&
+				    GetFieldDefinition(field) == stateField) {
+					body.RemoveAt(i);
+				}
+			}
 			int bodyLength;
 			if (tryFaultBlock != null) {
 				// there are try-finally blocks
@@ -406,7 +482,6 @@ namespace ICSharpCode.Decompiler.ILAst
 				bodyLength = body.Count;
 			} else {
 				// no try-finally blocks
-				body = ilMethod.Body;
 				if (returnVariable == null)
 					bodyLength = body.Count - 1; // all except for the return statement
 				else
@@ -461,10 +536,65 @@ namespace ICSharpCode.Decompiler.ILAst
 			newBody = new List<ILNode>();
 			newBody.Add(MakeGoTo(labels, 0));
 			List<SetState> stateChanges = new List<SetState>();
-			int currentState = -1;
-			// Copy all instructions from the old body to newBody.
-			for (int pos = startPos; pos < bodyLength; pos++) {
-				ILExpression expr = body[pos] as ILExpression;
+
+			var stack = new Stack<Tuple<int, int>>();
+			for (int i = body.Count - 1; i >= 0; --i) {
+				ILLabel blockEntry = body[i] as ILLabel;
+				var pair = labels.Find(x => x.Key == blockEntry);
+				if (blockEntry != null && !pair.Equals(default(KeyValuePair<ILLabel, StateRange>)) && !pair.Value.IsEmpty)
+					stack.Push(new Tuple<int, int>(i, pair.Value.Lower));
+			}
+
+			var observed = new HashSet<Tuple<int, int>>();
+			var usedLabels = new List<ILLabel>();
+
+			while (stack.Count > 0) {
+				var tuple = stack.Pop();
+				if (observed.Contains(tuple))
+					continue;
+				else
+					observed.Add(tuple);
+
+				int pos = tuple.Item1;
+				int currentState = tuple.Item2;
+
+				ILNode stmt = body[pos];
+				ILExpression expr = stmt as ILExpression;
+
+				ILLabel currentLabel = stmt as ILLabel;
+				if (currentLabel != null) {
+					if (usedLabels.Contains(currentLabel))
+						continue;
+					usedLabels.Add(currentLabel);
+				}
+
+				if (stmt.IsUnconditionalControlFlow()) {
+					foreach (ILLabel target in expr.GetBranchTargets()) {
+						int i = body.FindIndex(x => x == target);
+						// bulletproof way to safe dereference body[i + 1]
+						if (i < 0)
+							// label in nested block
+							newBody.Add(MakeGoTo(target));
+						else if (i >= 0 && i < body.Count - 1 && body[i] != returnFalseLabel && body[i + 1].IsUnconditionalControlFlow())
+							// inline on direct jumps
+							stack.Push(new Tuple<int, int>(i + 1, currentState));
+						else {
+							// jump to label or yield break
+							newBody.Add(MakeGoTo(target));
+							if (body[i] != returnFalseLabel)
+								stack.Push(new Tuple<int, int>(i, currentState));
+						}
+					}
+					continue;
+				} else if (stmt.IsConditionalControlFlow()) {
+					foreach (ILLabel target in expr.GetBranchTargets()) {
+						int index = body.FindIndex(x => x == target);
+						// ensure any dependent labels being processed
+						if (index >= 0)
+							stack.Push(new Tuple<int, int>(index, currentState));
+					}
+				}
+
 				if (expr != null && expr.Code == ILCode.Stfld && expr.Arguments[0].MatchThis()) {
 					// Handle stores to 'state' or 'current'
 					if (GetFieldDefinition(expr.Operand as FieldReference) == stateField) {
@@ -537,6 +667,8 @@ namespace ICSharpCode.Decompiler.ILAst
 				} else {
 					newBody.Add(body[pos]);
 				}
+				if (pos < body.Count - 1 && !stmt.IsUnconditionalControlFlow())
+					stack.Push(new Tuple<int, int>(pos + 1, currentState));
 			}
 			newBody.Add(new ILExpression(ILCode.YieldBreak, null));
 		}
