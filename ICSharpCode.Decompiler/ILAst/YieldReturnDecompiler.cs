@@ -568,7 +568,7 @@ namespace ICSharpCode.Decompiler.ILAst
 					usedLabels.Add(currentLabel);
 				}
 
-				if (stmt.IsUnconditionalControlFlow()) {
+				if (expr != null && expr.Code == ILCode.Br) {
 					foreach (ILLabel target in expr.GetBranchTargets()) {
 						int i = body.FindIndex(x => x == target);
 						// bulletproof way to safe dereference body[i + 1]
@@ -585,7 +585,6 @@ namespace ICSharpCode.Decompiler.ILAst
 								stack.Push(new Tuple<int, int>(i, currentState));
 						}
 					}
-					continue;
 				} else if (stmt.IsConditionalControlFlow()) {
 					foreach (ILLabel target in expr.GetBranchTargets()) {
 						int index = body.FindIndex(x => x == target);
@@ -593,9 +592,8 @@ namespace ICSharpCode.Decompiler.ILAst
 						if (index >= 0)
 							stack.Push(new Tuple<int, int>(index, currentState));
 					}
-				}
-
-				if (expr != null && expr.Code == ILCode.Stfld && expr.Arguments[0].MatchThis()) {
+					newBody.Add(expr);
+				} else if (expr != null && expr.Code == ILCode.Stfld && expr.Arguments[0].MatchThis()) {
 					// Handle stores to 'state' or 'current'
 					if (GetFieldDefinition(expr.Operand as FieldReference) == stateField) {
 						if (expr.Arguments[1].Code != ILCode.Ldc_I4)
